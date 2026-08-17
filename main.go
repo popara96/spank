@@ -389,8 +389,10 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	if pack != nil {
 		tracker = newSlapTracker(pack, tuning.cooldown)
 	} else {
-		// openApp mode: use a minimal tracker for slap counting only.
-		tracker = &slapTracker{}
+		// openApp mode: use a minimal tracker just for slap counting.
+		// Cooldown is enforced separately via lastYell; halfLife and scale
+		// are not needed without a sound pack.
+		tracker = &slapTracker{halfLife: decayHalfLife}
 	}
 	speakerInit := false
 	det := detector.New()
