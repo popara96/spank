@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -47,19 +48,20 @@ var haloAudio embed.FS
 var lizardAudio embed.FS
 
 var (
-	sexyMode     bool
-	haloMode     bool
-	lizardMode   bool
-	customPath   string
-	customFiles  []string
-	fastMode     bool
-	minAmplitude float64
-	cooldownMs   int
-	stdioMode      bool
-	volumeScaling  bool
-	paused         bool
-	pausedMu       sync.RWMutex
-	speedRatio     float64
+	sexyMode      bool
+	haloMode      bool
+	lizardMode    bool
+	customPath    string
+	customFiles   []string
+	fastMode      bool
+	minAmplitude  float64
+	cooldownMs    int
+	stdioMode     bool
+	volumeScaling bool
+	paused        bool
+	pausedMu      sync.RWMutex
+	speedRatio    float64
+	openApp       string
 )
 
 // sensorReady is closed once shared memory is created and the sensor
@@ -236,7 +238,10 @@ within a minute, the more intense the sounds become.
 Use --halo to play random audio clips from Halo soundtracks on each slap.
 
 Use --lizard for lizard mode. Like sexy mode, the more you slap
-within a minute, the more intense the sounds become.`,
+within a minute, the more intense the sounds become.
+
+Use --open <AppName> to launch a macOS application on each slap instead
+of playing audio (e.g. --open "Safari").`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			tuning := defaultTuning()
@@ -266,6 +271,7 @@ within a minute, the more intense the sounds become.`,
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
 	cmd.Flags().BoolVar(&volumeScaling, "volume-scaling", false, "Scale playback volume by slap amplitude (harder hits = louder)")
 	cmd.Flags().Float64Var(&speedRatio, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
+	cmd.Flags().StringVar(&openApp, "open", "", "Open a macOS application on each slap instead of playing audio (e.g. --open \"Safari\")")
 
 	if err := fang.Execute(context.Background(), cmd); err != nil {
 		os.Exit(1)
@@ -290,8 +296,11 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	if customPath != "" || len(customFiles) > 0 {
 		modeCount++
 	}
+	if openApp != "" {
+		modeCount++
+	}
 	if modeCount > 1 {
-		return fmt.Errorf("--sexy, --halo, --lizard, and --custom/--custom-files are mutually exclusive; pick one")
+		return fmt.Errorf("--sexy, --halo, --lizard, --custom/--custom-files, and --open are mutually exclusive; pick one")
 	}
 
 	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
@@ -303,6 +312,9 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 
 	var pack *soundPack
 	switch {
+	case openApp != "":
+		// No sound pack needed; slaps will launch an app instead.
+		pack = nil
 	case len(customFiles) > 0:
 		// Validate all files exist and are MP3s
 		for _, f := range customFiles {
@@ -326,8 +338,8 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 		pack = &soundPack{name: "pain", fs: painAudio, dir: "audio/pain", mode: modeRandom}
 	}
 
-	// Only load files if not already set (customFiles case)
-	if len(pack.files) == 0 {
+	// Only load files if not already set (customFiles case) and a pack is configured.
+	if pack != nil && len(pack.files) == 0 {
 		if err := pack.loadFiles(); err != nil {
 			return fmt.Errorf("loading %s audio: %w", pack.name, err)
 		}
@@ -373,7 +385,13 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 }
 
 func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuffer, tuning runtimeTuning) error {
-	tracker := newSlapTracker(pack, tuning.cooldown)
+	var tracker *slapTracker
+	if pack != nil {
+		tracker = newSlapTracker(pack, tuning.cooldown)
+	} else {
+		// openApp mode: use a minimal tracker for slap counting only.
+		tracker = &slapTracker{}
+	}
 	speakerInit := false
 	det := detector.New()
 	var lastAccelTotal uint64
@@ -389,7 +407,11 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 	if fastMode {
 		presetLabel = "fast"
 	}
-	fmt.Printf("spank: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", pack.name, presetLabel)
+	modeName := "open-app"
+	if pack != nil {
+		modeName = pack.name
+	}
+	fmt.Printf("spank: listening for slaps in %s mode with %s tuning... (ctrl+c to quit)\n", modeName, presetLabel)
 	if stdioMode {
 		fmt.Println(`{"status":"ready"}`)
 	}
@@ -449,6 +471,26 @@ func listenForSlaps(ctx context.Context, pack *soundPack, accelRing *shm.RingBuf
 
 		lastYell = now
 		num, score := tracker.record(now)
+
+		if openApp != "" {
+			if stdioMode {
+				event := map[string]interface{}{
+					"timestamp":  now.Format(time.RFC3339Nano),
+					"slapNumber": num,
+					"amplitude":  ev.Amplitude,
+					"severity":   string(ev.Severity),
+					"app":        openApp,
+				}
+				if data, err := json.Marshal(event); err == nil {
+					fmt.Println(string(data))
+				}
+			} else {
+				fmt.Printf("slap #%d [%s amp=%.5fg] -> opening %s\n", num, ev.Severity, ev.Amplitude, openApp)
+			}
+			go launchApp(openApp)
+			continue
+		}
+
 		file := tracker.getFile(score)
 		if stdioMode {
 			event := map[string]interface{}{
@@ -665,5 +707,12 @@ func processCommands(r io.Reader, w io.Writer) {
 				fmt.Fprintf(w, `{"error":"unknown command: %s"}%s`, cmd.Cmd, "\n")
 			}
 		}
+	}
+}
+
+// launchApp opens a macOS application by name using the `open -a` command.
+func launchApp(app string) {
+	if err := exec.Command("open", "-a", app).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "spank: open -a %q: %v\n", app, err)
 	}
 }
